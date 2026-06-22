@@ -722,6 +722,16 @@ func (c *Client) dialURL(ctx context.Context) (net.Conn, error) {
 	if c.dialer != nil {
 		return c.dialer(ctx, "tcp", net.JoinHostPort(host, urlPort(c.url)))
 	}
+
+	// Check if an HTTP proxy should be used for this URL.
+	proxyReq := &http.Request{
+		Method: "GET",
+		URL:    c.url,
+	}
+	if proxyURL, err := tshttpproxy.ProxyFromEnvironment(proxyReq); err == nil && proxyURL != nil {
+		return c.dialURLUsingProxy(ctx, proxyURL)
+	}
+
 	hostOrIP := host
 	dialer := netns.NewDialer(c.logf, c.netMon)
 
@@ -956,6 +966,68 @@ func firstStr(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// dialURLUsingProxy connects to c.url using a CONNECT tunnel through the HTTP(s) proxy in proxyURL.
+func (c *Client) dialURLUsingProxy(ctx context.Context, proxyURL *url.URL) (proxyConn net.Conn, err error) {
+	pu := proxyURL
+	if pu.Scheme == "https" {
+		var d tls.Dialer
+		proxyConn, err = d.DialContext(ctx, "tcp", net.JoinHostPort(pu.Hostname(), firstStr(pu.Port(), "443")))
+	} else {
+		var d net.Dialer
+		proxyConn, err = d.DialContext(ctx, "tcp", net.JoinHostPort(pu.Hostname(), firstStr(pu.Port(), "80")))
+	}
+	defer func() {
+		if err != nil && proxyConn != nil {
+			go proxyConn.Close()
+		}
+	}()
+	if err != nil {
+		return nil, err
+	}
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			proxyConn.Close()
+		}
+	}()
+
+	target := net.JoinHostPort(c.url.Hostname(), urlPort(c.url))
+
+	var authHeader string
+	if v, err := tshttpproxy.GetAuthHeader(pu); err != nil {
+		c.logf("derphttp: error getting proxy auth header for %v: %v", proxyURL, err)
+	} else if v != "" {
+		authHeader = fmt.Sprintf("Proxy-Authorization: %s\r\n", v)
+	}
+
+	if _, err := fmt.Fprintf(proxyConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n%s\r\n", target, pu.Hostname(), authHeader); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
+	}
+
+	br := bufio.NewReader(proxyConn)
+	res, err := http.ReadResponse(br, nil)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		c.logf("derphttp: CONNECT dial to %s: %v", target, err)
+		return nil, err
+	}
+	c.logf("derphttp: CONNECT dial to %s: %v", target, res.Status)
+	if res.StatusCode != 200 {
+		return nil, fmt.Errorf("invalid response status from HTTP proxy %s on CONNECT to %s: %v", pu, target, res.Status)
+	}
+	return proxyConn, nil
 }
 
 // dialNodeUsingProxy connects to n using a CONNECT to the HTTP(s) proxy in proxyURL.

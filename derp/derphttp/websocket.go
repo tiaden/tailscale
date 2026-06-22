@@ -12,6 +12,7 @@ import (
 	"net/http"
 
 	"github.com/coder/websocket"
+	"tailscale.com/net/tshttpproxy"
 )
 
 func init() {
@@ -19,13 +20,16 @@ func init() {
 }
 
 func dialWebsocket(ctx context.Context, urlStr string, tlsConfig *tls.Config, httpHeader http.Header) (net.Conn, error) {
+	tr := &http.Transport{
+		TLSClientConfig: tlsConfig,
+		Proxy:           tshttpproxy.ProxyFromEnvironment,
+	}
+	tshttpproxy.SetTransportGetProxyConnectHeader(tr)
 	c, _, err := websocket.Dial(ctx, urlStr, &websocket.DialOptions{
 		Subprotocols: []string{"derp"},
 		HTTPHeader:   httpHeader,
 		HTTPClient: &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: tlsConfig,
-			},
+			Transport: tr,
 		},
 	})
 	// We can't log anything here, otherwise it'll appear in SSH output!
