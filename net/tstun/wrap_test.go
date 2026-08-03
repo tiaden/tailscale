@@ -253,6 +253,332 @@ func TestReadAndInject(t *testing.T) {
 	}
 }
 
+func TestInjectedOutboundFilter(t *testing.T) {
+	pkt := udp4("1.2.3.4", "5.6.7.8", 98, 89)
+	tests := []struct {
+		name       string
+		installed  bool
+		clear      bool
+		response   filter.Response
+		wantPacket bool
+	}{
+		{name: "zero_value", wantPacket: true},
+		{name: "cleared", installed: true, clear: true, wantPacket: true},
+		{name: "accept", installed: true, response: filter.Accept, wantPacket: true},
+		{name: "drop", installed: true, response: filter.Drop},
+		{name: "drop_silently", installed: true, response: filter.DropSilently},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, tun := newFakeTUN(t.Logf, false)
+			defer tun.Close()
+
+			stats := connstats.NewStatistics(0, 0, nil)
+			defer stats.Shutdown(context.Background())
+			tun.SetStatistics(stats)
+			tun.lastActivityAtomic.StoreAtomic(0)
+			var destinationActivity int
+			tun.SetDestIPActivityFuncs(map[netip.Addr]func(){
+				netip.MustParseAddr("5.6.7.8"): func() { destinationActivity++ },
+			})
+
+			var calls int
+			if tt.installed {
+				tun.SetInjectedOutboundFilter(func(p *packet.Parsed, gotTun *Wrapper) filter.Response {
+					calls++
+					if gotTun != tun {
+						t.Errorf("filter Wrapper = %p; want %p", gotTun, tun)
+					}
+					if got := p.Buffer(); !bytes.Equal(got, pkt) {
+						t.Errorf("filter packet = %x; want %x", got, pkt)
+					}
+					return tt.response
+				})
+				if tt.clear {
+					tun.SetInjectedOutboundFilter(nil)
+				}
+			}
+
+			if err := tun.InjectOutbound(pkt); err != nil {
+				t.Fatalf("InjectOutbound: %v", err)
+			}
+			var buf [MaxPacketSize]byte
+			sizes := []int{-1}
+			n, err := tun.Read([][]byte{buf[:]}, sizes, 0)
+			if err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+
+			wantCalls := 0
+			if tt.installed && !tt.clear {
+				wantCalls = 1
+			}
+			if calls != wantCalls {
+				t.Errorf("filter calls = %d; want %d", calls, wantCalls)
+			}
+			wantDestinationActivity := 0
+			if tt.wantPacket {
+				wantDestinationActivity = 1
+			}
+			if destinationActivity != wantDestinationActivity {
+				t.Errorf("destination activity calls = %d; want %d", destinationActivity, wantDestinationActivity)
+			}
+			if tt.wantPacket {
+				if n != 1 {
+					t.Fatalf("Read packets = %d; want 1", n)
+				}
+				if got := buf[:sizes[0]]; !bytes.Equal(got, pkt) {
+					t.Errorf("Read packet = %x; want %x", got, pkt)
+				}
+				if tun.lastActivityAtomic.LoadAtomic() == 0 {
+					t.Error("accepted packet did not record activity")
+				}
+				return
+			}
+
+			if n != 0 {
+				t.Errorf("Read packets = %d; want 0", n)
+			}
+			if sizes[0] != 0 {
+				t.Errorf("Read size = %d; want 0", sizes[0])
+			}
+			if tun.lastActivityAtomic.LoadAtomic() != 0 {
+				t.Error("dropped packet recorded activity")
+			}
+			virtual, physical := stats.TestExtract()
+			if len(virtual) != 0 || len(physical) != 0 {
+				t.Errorf("dropped packet updated stats: virtual=%v, physical=%v", virtual, physical)
+			}
+		})
+	}
+}
+
+func TestInjectedOutboundFilterPacketBufferRelease(t *testing.T) {
+	pkt := udp4("1.2.3.4", "5.6.7.8", 98, 89)
+	tests := []struct {
+		name       string
+		installed  bool
+		response   filter.Response
+		wantPacket bool
+	}{
+		{name: "nil", wantPacket: true},
+		{name: "accept", installed: true, response: filter.Accept, wantPacket: true},
+		{name: "drop", installed: true, response: filter.Drop},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, tun := newFakeTUN(t.Logf, false)
+			defer tun.Close()
+			var calls int
+			if tt.installed {
+				tun.SetInjectedOutboundFilter(func(*packet.Parsed, *Wrapper) filter.Response {
+					calls++
+					return tt.response
+				})
+			}
+
+			released := make(chan struct{})
+			packetBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
+				Payload:   buffer.MakeWithData(append([]byte(nil), pkt...)),
+				OnRelease: func() { close(released) },
+			})
+			if err := tun.InjectOutboundPacketBuffer(packetBuf); err != nil {
+				t.Fatalf("InjectOutboundPacketBuffer: %v", err)
+			}
+
+			var buf [MaxPacketSize]byte
+			sizes := make([]int, 1)
+			n, err := tun.Read([][]byte{buf[:]}, sizes, 0)
+			if err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			wantCalls := 0
+			if tt.installed {
+				wantCalls = 1
+			}
+			if calls != wantCalls {
+				t.Errorf("filter calls = %d; want %d", calls, wantCalls)
+			}
+			if tt.wantPacket {
+				if n != 1 || !bytes.Equal(buf[:sizes[0]], pkt) {
+					t.Errorf("Read = (%d, %x); want (1, %x)", n, buf[:sizes[0]], pkt)
+				}
+			} else if n != 0 || sizes[0] != 0 {
+				t.Errorf("Read = (%d, size %d); want (0, size 0)", n, sizes[0])
+			}
+			select {
+			case <-released:
+			default:
+				t.Error("injected packet-buffer reference was not released")
+			}
+		})
+	}
+}
+
+func TestInjectedOutboundFilterZeroLength(t *testing.T) {
+	pkt := udp4("1.2.3.4", "5.6.7.8", 98, 89)
+	tests := []struct {
+		name   string
+		inject func(*testing.T, *Wrapper, []byte)
+	}{
+		{
+			name: "bytes",
+			inject: func(t *testing.T, tun *Wrapper, pkt []byte) {
+				t.Helper()
+				if err := tun.InjectOutbound(pkt); err != nil {
+					t.Fatalf("InjectOutbound: %v", err)
+				}
+			},
+		},
+		{
+			name: "packet_buffer",
+			inject: func(t *testing.T, tun *Wrapper, pkt []byte) {
+				t.Helper()
+				released := make(chan struct{})
+				packetBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
+					Payload:   buffer.MakeWithData(append([]byte(nil), pkt...)),
+					OnRelease: func() { close(released) },
+				})
+				if err := tun.InjectOutboundPacketBuffer(packetBuf); err != nil {
+					t.Fatalf("InjectOutboundPacketBuffer: %v", err)
+				}
+				if len(pkt) == 0 {
+					select {
+					case <-released:
+					default:
+						t.Error("zero-length packet-buffer reference was not released")
+					}
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, tun := newFakeTUN(t.Logf, false)
+			defer tun.Close()
+			var calls int
+			tun.SetInjectedOutboundFilter(func(*packet.Parsed, *Wrapper) filter.Response {
+				calls++
+				return filter.Accept
+			})
+
+			tt.inject(t, tun, nil)
+			tt.inject(t, tun, pkt)
+			var buf [MaxPacketSize]byte
+			sizes := make([]int, 1)
+			n, err := tun.Read([][]byte{buf[:]}, sizes, 0)
+			if err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			if n != 1 || !bytes.Equal(buf[:sizes[0]], pkt) {
+				t.Errorf("Read = (%d, %x); want (1, %x)", n, buf[:sizes[0]], pkt)
+			}
+			if calls != 1 {
+				t.Errorf("filter calls = %d; want 1", calls)
+			}
+		})
+	}
+}
+
+func TestInjectedOutboundFilterRunsAfterSNAT(t *testing.T) {
+	_, tun := newFakeTUN(t.Logf, false)
+	defer tun.Close()
+
+	nativeIP := netip.MustParseAddr("100.64.0.1")
+	peerIP := netip.MustParseAddr("100.64.0.2")
+	masqIP := netip.MustParseAddr("100.64.1.1")
+	tun.SetWGConfig(&wgcfg.Config{
+		Addresses: []netip.Prefix{netip.PrefixFrom(nativeIP, nativeIP.BitLen())},
+		Peers: []wgcfg.Peer{{
+			PublicKey:  key.NewNode().Public(),
+			AllowedIPs: []netip.Prefix{netip.PrefixFrom(peerIP, peerIP.BitLen())},
+			V4MasqAddr: ptr.To(masqIP),
+		}},
+	})
+
+	var filterSrc netip.Addr
+	tun.SetInjectedOutboundFilter(func(p *packet.Parsed, _ *Wrapper) filter.Response {
+		filterSrc = p.Src.Addr()
+		return filter.Accept
+	})
+	if err := tun.InjectOutbound(udp4(nativeIP.String(), peerIP.String(), 98, 89)); err != nil {
+		t.Fatalf("InjectOutbound: %v", err)
+	}
+
+	var buf [MaxPacketSize]byte
+	sizes := make([]int, 1)
+	if _, err := tun.Read([][]byte{buf[:]}, sizes, 0); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if filterSrc != masqIP {
+		t.Errorf("filter source = %v; want post-SNAT source %v", filterSrc, masqIP)
+	}
+	var got packet.Parsed
+	got.Decode(buf[:sizes[0]])
+	if got.Src.Addr() != masqIP {
+		t.Errorf("delivered source = %v; want %v", got.Src.Addr(), masqIP)
+	}
+}
+
+func TestInjectedOutboundFilterConcurrentSet(t *testing.T) {
+	_, tun := newFakeTUN(t.Logf, false)
+	defer tun.Close()
+
+	accept := FilterFunc(func(*packet.Parsed, *Wrapper) filter.Response { return filter.Accept })
+	drop := FilterFunc(func(*packet.Parsed, *Wrapper) filter.Response { return filter.Drop })
+	start := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-start
+		for i := 0; i < 1_000; i++ {
+			switch i % 3 {
+			case 0:
+				tun.SetInjectedOutboundFilter(accept)
+			case 1:
+				tun.SetInjectedOutboundFilter(drop)
+			case 2:
+				tun.SetInjectedOutboundFilter(nil)
+			}
+		}
+	}()
+
+	close(start)
+	pkt := udp4("1.2.3.4", "5.6.7.8", 98, 89)
+	var buf [MaxPacketSize]byte
+	sizes := make([]int, 1)
+	for i := 0; i < 1_000; i++ {
+		if err := tun.InjectOutbound(pkt); err != nil {
+			t.Fatalf("InjectOutbound: %v", err)
+		}
+		if _, err := tun.Read([][]byte{buf[:]}, sizes, 0); err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+	}
+	<-done
+}
+
+func BenchmarkInjectedOutboundFilter(b *testing.B) {
+	tun := new(Wrapper)
+	tun.SetInjectedOutboundFilter(func(*packet.Parsed, *Wrapper) filter.Response {
+		return filter.Accept
+	})
+	pkt := udp4("1.2.3.4", "5.6.7.8", 98, 89)
+	injected := tunInjectedRead{data: pkt}
+	var buf [MaxPacketSize]byte
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		n, err := tun.injectedRead(injected, buf[:], 0)
+		if err != nil || n != len(pkt) {
+			b.Fatalf("injectedRead = (%d, %v); want (%d, nil)", n, err, len(pkt))
+		}
+	}
+}
+
 func TestWriteAndInject(t *testing.T) {
 	chtun, tun := newChannelTUN(t.Logf, false)
 	defer tun.Close()

@@ -147,6 +147,9 @@ type Wrapper struct {
 	filter atomic.Pointer[filter.Filter]
 	// filterFlags control the verbosity of logging packet drops/accepts.
 	filterFlags filter.RunFlags
+	// injectedOutboundFilter atomically stores the optional filter for packets
+	// injected toward WireGuard by internal networking stacks.
+	injectedOutboundFilter syncs.AtomicValue[FilterFunc]
 
 	// PreFilterPacketInboundFromWireGuard is the inbound filter function that runs before the main filter
 	// and therefore sees the packets that may be later dropped by it.
@@ -731,7 +734,7 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 	if res.data == nil {
 		n, err := t.injectedRead(res.injected, buffs[0], offset)
 		sizes[0] = n
-		if err != nil && n == 0 {
+		if n == 0 {
 			return 0, err
 		}
 
@@ -805,6 +808,13 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, buf []byte, offset int) (int
 	defer parsedPacketPool.Put(p)
 	p.Decode(buf[offset : offset+n])
 	t.snatV4(p)
+	if f := t.injectedOutboundFilter.Load(); f != nil {
+		if res := f(p, t); res.IsDrop() {
+			metricPacketOutDrop.Add(1)
+			metricPacketOutDropFilter.Add(1)
+			return 0, nil
+		}
+	}
 
 	if m := t.destIPActivity.Load(); m != nil {
 		if fn := m[p.Dst.Addr()]; fn != nil {
@@ -969,6 +979,15 @@ func (t *Wrapper) GetFilter() *filter.Filter {
 
 func (t *Wrapper) SetFilter(filt *filter.Filter) {
 	t.filter.Store(filt)
+}
+
+// SetInjectedOutboundFilter sets the optional filter for packets injected
+// toward WireGuard by internal networking stacks. The filter runs after packet
+// decoding and source NAT, but before connection statistics, destination
+// activity, wrapper activity, and delivery. It may be replaced concurrently,
+// and nil disables it.
+func (t *Wrapper) SetInjectedOutboundFilter(filt FilterFunc) {
+	t.injectedOutboundFilter.Store(filt)
 }
 
 // InjectInboundPacketBuffer makes the Wrapper device behave as if a packet
